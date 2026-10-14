@@ -14,6 +14,13 @@
 const {StatusCodes} = require('http-status-codes')
 const BookingService = require('../services/booking-service')
 const {SuccessResponse,ErrorResponse} = require('../utils/common');
+const { Logger } = require('../config');
+
+// Expected failures (4xx: expired booking, cost mismatch) are warnings; anything else is an error
+function logFailure(action, error) {
+    const statusCode = error.statusCode || StatusCodes.INTERNAL_SERVER_ERROR;
+    Logger.log(statusCode >= 500 ? 'error' : 'warn', `${action} failed`, { statusCode, err: error });
+}
 
 /*
  * createBooking
@@ -43,6 +50,7 @@ async function createBooking(req,res){
         SuccessResponse.data= response;
         return res.status(StatusCodes.OK).json(SuccessResponse)
     } catch (error) {
+        logFailure('createBooking', error);
         ErrorResponse.error = error;
         // fallback to 500 if error is not an AppError (no statusCode property)
         return res.status(error.statusCode || StatusCodes.INTERNAL_SERVER_ERROR).json(ErrorResponse);
@@ -79,6 +87,7 @@ async function makePayment(req,res){
         SuccessResponse.data= response;
         return res.status(StatusCodes.OK).json(SuccessResponse)
     } catch (error) {
+        logFailure('makePayment', error);
         ErrorResponse.error = error;
         // fallback to 500 if error is not an AppError (no statusCode property)
         return res.status(error.statusCode || StatusCodes.INTERNAL_SERVER_ERROR).json(ErrorResponse);
@@ -112,6 +121,7 @@ async function cancelUserBooking(req, res) {
         SuccessResponse.data = { message: 'Booking cancelled successfully' };
         return res.status(StatusCodes.OK).json(SuccessResponse);
     } catch (error) {
+        logFailure('cancelUserBooking', error);
         ErrorResponse.error = error;
         return res.status(error.statusCode || StatusCodes.INTERNAL_SERVER_ERROR).json(ErrorResponse);
     }
@@ -134,6 +144,7 @@ async function getMyBookings(req, res) {
         SuccessResponse.data = bookings;
         return res.status(StatusCodes.OK).json(SuccessResponse);
     } catch (error) {
+        logFailure('getMyBookings', error);
         ErrorResponse.error = error;
         return res.status(error.statusCode || StatusCodes.INTERNAL_SERVER_ERROR).json(ErrorResponse);
     }

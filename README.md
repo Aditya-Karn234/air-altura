@@ -220,7 +220,9 @@ The 10-minute payment window is enforced by two independent mechanisms running i
 
 ### Idempotency on Payment
 
-The `POST /booking/payment` endpoint requires an `Idempotency-Key` UUID header. The first call executes the payment and caches `{ statusCode, body }` in Redis for 24 hours. Any retry with the same key returns the cached response — the handler never runs twice. Only 2xx responses are cached; a failed payment can be retried with the same key after the client corrects the issue.
+The `POST /booking/payment` endpoint requires an `Idempotency-Key` UUID header. The first call claims the key atomically in Redis (`SET NX`), executes the payment and caches `{ statusCode, body }` for 24 hours. Any retry with the same key returns the cached response — the handler never runs twice. A duplicate that arrives while the first request is still running (a double-click) gets `409 Conflict` with `Retry-After: 1`. Only 2xx responses are cached; a failed payment releases the key so it can be retried after the client corrects the issue.
+
+Keys are scoped per user, so one user's key can never return another user's cached response. The in-progress claim expires after 60 seconds, so a request that dies mid-flight doesn't block retries.
 
 If Redis is down, the middleware fails open and lets the request through rather than blocking the payment endpoint.
 
@@ -229,6 +231,28 @@ If Redis is down, the middleware fails open and lets the request through rather 
 All seat restoration on cancellation (manual, cron, or payment expiry) goes through a durable RabbitMQ `seat.restoration` queue. The Flights Service subscribes and increments the cabin seat count. Events survive RabbitMQ restarts (`persistent: true`) and wait in the queue if the Flights Service is temporarily down — no seat count is permanently lost.
 
 Events are published **after** the transaction commits, never inside it. The DB is the source of truth.
+
+Every service that talks to RabbitMQ reconnects on its own after a broker restart or dropped connection (every 5 seconds, `RABBITMQ_RECONNECT_DELAY_MS`), re-asserts its queues and re-subscribes its consumers. While the booking service is disconnected, a publish fails and is logged as an error rather than failing the request.
+
+### Structured Logging & Request IDs
+
+All four backend services write one JSON object per line to stdout:
+
+```json
+{"level":"info","message":"request completed","method":"POST","path":"/api/v1/booking/payment","status":200,"durationMs":41.2,"requestId":"5f0c…","service":"booking-service","timestamp":"2026-10-13T10:42:33.265Z"}
+```
+
+The API Gateway reuses the caller's `X-Request-Id` header or generates a UUID, returns it in the response, and forwards it to the downstream service. The booking service passes it on to the Flights Service over HTTP and puts it in the headers of every RabbitMQ message it publishes. The Flights and Notifications consumers log under that same ID. One ID therefore follows a payment from the gateway through to the confirmation email. Cron-triggered cancellations get their own `cron-<uuid>` ID.
+
+The ID is held in `AsyncLocalStorage` (`src/utils/request-context.js` in each service), so code calls `Logger.info('…', { bookingId })` and never passes it by hand. Set `LOG_LEVEL` in `.env.docker` to change verbosity (default `info`).
+
+To follow one request across services:
+
+```bash
+bash scripts/diagnose.sh --trace <request-id>
+# or directly:
+docker compose logs --no-log-prefix api-gateway booking-service flights-service notifications-service | grep '"requestId":"<request-id>"'
+```
 
 ### Redis Caching
 
@@ -291,6 +315,55 @@ Features that are natural extensions to this system but not currently implemente
 - The notifications service has no HTTP server. It stays alive as a RabbitMQ consumer.
 - The flights dataset is seeded through a one-time `flights-seeder` service.
 - The frontend is served from nginx in Docker, not the Vite dev server.
+
+## Diagnostics
+
+`scripts/diagnose.sh` checks the running Docker stack and reports `PASS` / `WARN` / `FAIL` for each item:
+
+```bash
+bash scripts/diagnose.sh               # all checks
+bash scripts/diagnose.sh --since 1h    # scan a longer window of logs for errors
+bash scripts/diagnose.sh --trace <id>  # every log line for one request ID, in time order
+```
+
+| Area | What it checks |
+|---|---|
+| Docker | daemon reachable, compose v2, `.env.docker` present |
+| Containers | each service running and healthy, seeder completed, restart counts (crash loops), OOM kills |
+| HTTP | gateway, flights, booking and frontend respond; gateway returns `X-Request-Id` |
+| MySQL | server up, all three databases exist, applied migrations vs files in the repo, upcoming flights left, unpaid bookings the cron should have cancelled, connection usage |
+| Redis | `PING`, memory and eviction (evictions can drop idempotency records), failed background saves, key counts per prefix |
+| RabbitMQ | node up, memory/disk alarms, each queue's consumers / backlog / durability, client connection count |
+| Logs | error lines per service in the window, with the request ID of the latest ones |
+
+It needs only Docker and `curl` on the host; database commands run inside the containers. It exits `1` if any check fails, so it can be used in CI or a deploy script.
+
+## Failure-Recovery Tests
+
+`tests/failure-recovery` covers booking idempotency and RabbitMQ message processing under failure. The tests use Node's built-in test runner, so there's nothing extra to install. They do need each service's dependencies installed (`npm install` in each service folder).
+
+**Unit tests** need no Docker. They run the real middleware, consumers and RabbitMQ connection code against fake Redis/RabbitMQ that can be made to fail:
+
+```bash
+node --test "tests/failure-recovery/unit/*.test.js"
+```
+
+- Idempotency: retry replays the cached response, concurrent duplicates → one charge and `409`s, failed payments are retryable, keys are per user, Redis down → fails open and recovers.
+- Consumers: DB down → seat restoration is requeued and applied on redelivery; email failures and malformed messages are discarded; request IDs carry over from message headers.
+- Connections: broker restart doesn't crash the service, reconnects once, re-registers consumers, keeps retrying while the broker is down.
+
+**Integration tests** run against the live Docker stack and **stop and restart containers**. Run them on a local stack only:
+
+```bash
+docker compose up -d --build
+node --test --test-concurrency=1 "tests/failure-recovery/integration/*.test.js"
+```
+
+- Retried, concurrent, rejected-then-fixed and cross-user payments, counting the `booking.confirmed` messages actually queued.
+- Flights Service down during a cancellation → restoration waits in the queue and seats come back when it restarts.
+- RabbitMQ restart → persistent messages survive; every service reconnects without Docker restarting it, and a payment + cancellation flow end to end afterwards.
+
+Override endpoints with `GATEWAY_URL`, `FLIGHTS_URL`, `RABBITMQ_API_URL` and `RABBITMQ_API_CREDENTIALS` (`user:pass`) if needed.
 
 ## k6 Performance Testing
 

@@ -17,6 +17,9 @@
  */
 
 const cron = require('node-cron');
+const { randomUUID } = require('node:crypto');
+const Logger = require('../../config/logger-config');
+const { runWithRequestId } = require('../request-context');
 
 const {BookingService} = require('../../services/');
 
@@ -36,9 +39,12 @@ function scheduleCrons(){
      *   makePayment independently enforces the hard 10-minute cutoff at payment time,
      *   so no user ever actually gets more than 10 minutes regardless of cron timing.
      */
-    cron.schedule('*/5 * * * *', async () => {
-        const response = await BookingService.cancelOldBookings();
-        console.log(response); // logs [ affectedRows ] — 0 if no abandoned bookings this tick
+    cron.schedule('*/5 * * * *', () => {
+        // Give each tick its own ID so the seat.restoration events it publishes can be traced
+        return runWithRequestId(`cron-${randomUUID()}`, async () => {
+            const response = await BookingService.cancelOldBookings();
+            Logger.info('Abandoned booking cleanup finished', { cancelled: response?.[0] ?? 0 });
+        });
     });
 }
 

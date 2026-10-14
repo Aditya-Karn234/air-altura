@@ -21,31 +21,46 @@
  *  - No seats are permanently lost
  */
 
-const { RabbitMQ } = require('../config');
+const { RabbitMQ, Logger } = require('../config');
 const { FlightService } = require('../services');
+const { REQUEST_ID_HEADER, resolveRequestId, runWithRequestId } = require('../utils/request-context');
 
-async function subscribeSeatRestoration() {
-    const channel = RabbitMQ.getChannel();
+/*
+ * handleSeatRestoration
+ *
+ * Processes one message. Runs inside the request ID carried in the message headers,
+ * so these logs share an ID with the booking request that cancelled the seats.
+ */
+async function handleSeatRestoration(channel, message) {
+    const requestId = resolveRequestId(message.properties.headers?.[REQUEST_ID_HEADER]);
 
-    channel.consume('seat.restoration', async (message) => {
-        if (!message) return;
-
+    return runWithRequestId(requestId, async () => {
         try {
             const { bookingId, flightId, seats, seatClass } = JSON.parse(message.content.toString());
-            console.log(`Restoring ${seats} seat(s) for flight ${flightId} (booking ${bookingId})${seatClass ? ` [${seatClass}]` : ''}`);
+            Logger.info('Restoring seats', { bookingId, flightId, seats, seatClass, redelivered: message.fields.redelivered });
 
             await FlightService.updateSeats({ flightId, seats, dec: false, seatClass });
 
             // ack — tell RabbitMQ this message was processed successfully, remove from queue
             channel.ack(message);
         } catch (error) {
-            console.error('Seat restoration failed, requeueing message:', error.message);
+            Logger.error('Seat restoration failed, requeueing message', { err: error });
             // nack with requeue:true — put message back in queue for retry
             channel.nack(message, false, true);
         }
     });
+}
 
-    console.log('Seat restoration subscriber active');
+async function subscribeSeatRestoration() {
+    // registerConsumer re-runs this after every RabbitMQ reconnect
+    await RabbitMQ.registerConsumer(async (channel) => {
+        await channel.consume('seat.restoration', (message) => {
+            if (!message) return;
+            return handleSeatRestoration(channel, message);
+        });
+        Logger.info('Seat restoration subscriber active');
+    });
 }
 
 module.exports = subscribeSeatRestoration;
+module.exports.handleSeatRestoration = handleSeatRestoration;

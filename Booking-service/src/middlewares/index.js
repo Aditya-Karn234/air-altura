@@ -1,3 +1,4 @@
 module.exports = {
-    idempotencyMiddleware: require('./idempotency')
+    idempotencyMiddleware: require('./idempotency'),
+    requestLogger: require('./request-logger').requestLogger
 }

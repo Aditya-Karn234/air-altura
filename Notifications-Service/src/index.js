@@ -10,7 +10,7 @@
  * It stays alive as long as the RabbitMQ connection is open.
  */
 
-const { RabbitMQ } = require('./config');
+const { RabbitMQ, Logger } = require('./config');
 const { subscribeBookingConfirmed } = require('./subscribers/booking-confirmed');
 
 async function start() {
@@ -19,9 +19,9 @@ async function start() {
 
         await subscribeBookingConfirmed();
 
-        console.log('Notifications Service running');
+        Logger.info('Notifications Service running');
     } catch (err) {
-        console.error('Failed to start Notifications Service:', err.message);
+        Logger.error('Failed to start Notifications Service', { err });
         process.exit(1);
     }
 }

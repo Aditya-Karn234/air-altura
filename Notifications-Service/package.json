@@ -16,6 +16,7 @@
     "ioredis": "^5.10.1",
     "mysql2": "^3.22.3",
     "resend": "^6.12.3",
-    "sequelize": "^6.37.8"
+    "sequelize": "^6.37.8",
+    "winston": "^3.19.0"
   }
 }

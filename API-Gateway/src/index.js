@@ -1,7 +1,9 @@
 const express = require('express');
 const cors = require('cors');
 const { PORT } = require('./config/server-config');
+const logger = require('./config/logger-config');
 const { sequelize } = require('./models');
+const { requestLogger } = require('./middlewares/request-logger');
 const apiRoutes = require('./routes');
 
 const app = express();
@@ -11,7 +13,8 @@ const app = express();
 app.use(cors({
     origin: process.env.ALLOWED_ORIGIN || '*',
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Request-Id'],
+    exposedHeaders: ['X-Request-Id'],
 }));
 
 // Body parsing only applied to /api/v1/auth - routes the Gateway handles directly.
@@ -20,14 +23,17 @@ app.use(cors({
 app.use('/api/v1/auth', express.json());
 app.use('/api/v1/auth', express.urlencoded({ extended: true }));
 
+// Registered after the body parsers so their stream callbacks can't drop the request context
+app.use(requestLogger);
+
 app.use('/api', apiRoutes);
 
 app.listen(PORT, async () => {
-    console.log(`API Gateway running on port ${PORT}`);
+    logger.info('API Gateway started', { port: Number(PORT) });
     try {
         await sequelize.authenticate();
-        console.log('DB connected');
+        logger.info('DB connected');
     } catch (err) {
-        console.error('DB connection failed:', err.message);
+        logger.error('DB connection failed', { err });
     }
 });

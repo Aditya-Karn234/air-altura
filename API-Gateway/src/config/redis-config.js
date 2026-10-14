@@ -1,5 +1,6 @@
 const Redis = require('ioredis');
 const { REDIS_HOST, REDIS_PORT } = require('./server-config');
+const logger = require('./logger-config');
 
 const redis = process.env.REDIS_URL
     ? new Redis(process.env.REDIS_URL, { lazyConnect: true })
@@ -9,7 +10,7 @@ const redis = process.env.REDIS_URL
         lazyConnect: true,
     });
 
-redis.on('connect', () => console.log('Redis connected'));
-redis.on('error', (err) => console.error('Redis error:', err.message));
+redis.on('connect', () => logger.info('Redis connected'));
+redis.on('error', (err) => logger.error('Redis error', { err }));
 
 module.exports = redis;

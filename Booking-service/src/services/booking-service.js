@@ -17,7 +17,8 @@ const axios = require('axios')
 
 const {BookingRepository} = require('../repositories');
 
-const { ServerConfig, RabbitMQ } = require('../config')
+const { ServerConfig, RabbitMQ, Logger } = require('../config')
+const { REQUEST_ID_HEADER, getRequestId } = require('../utils/request-context');
 const db = require('../models');
 const AppError = require('../utils/errors/app-error');
 const { StatusCodes } = require('http-status-codes');
@@ -26,6 +27,15 @@ const { StatusCodes } = require('http-status-codes');
 const bookingRepository = new BookingRepository()
 const { ENUMS } = require('../utils/common')
 const {BOOKED,CANCELLED} = ENUMS.BOOKING_STATUS;
+
+// HTTP client for the Flight Service. Forwards the current request ID so the
+// Flight Service's logs line up with ours.
+const flightClient = axios.create({ baseURL: ServerConfig.FLIGHT_SERVICE });
+flightClient.interceptors.request.use((config) => {
+    const requestId = getRequestId();
+    if (requestId) config.headers[REQUEST_ID_HEADER] = requestId;
+    return config;
+});
 
 
 /*
@@ -55,7 +65,7 @@ async function createBooking(data){
     try{
         // Step 1: fetch flight details from Flight Service (includes FlightClasses since getFlight eager-loads them)
         // flight.data.data because Flight Service wraps response as { success, message, data: { flightObj } }
-        const flight = await axios.get(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`);
+        const flight = await flightClient.get(`/api/v1/flights/${data.flightId}`);
         const flightData = flight.data.data;
 
         // Step 2: locate the requested cabin class and validate seat availability
@@ -83,7 +93,7 @@ async function createBooking(data){
         const booking = await bookingRepository.createBooking(bookingPayload, transaction);
 
         // Step 5: reserve seats on the flight service for the specific cabin class
-        await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats`, {
+        await flightClient.patch(`/api/v1/flights/${data.flightId}/seats`, {
             seats: data.noofSeats,
             seatClass
         });
@@ -162,20 +172,16 @@ async function makePayment(data){
         // Wrapped in its own try-catch: a failed publish must NOT affect the payment response.
         // The booking is already committed to DB — that is the source of truth.
         try {
-            const channel = RabbitMQ.getChannel();
-            channel.sendToQueue(
-                'booking.confirmed',
-                Buffer.from(JSON.stringify({
-                    bookingId: data.bookingId,
-                    userId:    data.userId,
-                    email:     data.email,
-                    flightId:  bookingDetails.flightId,
-                    totalCost: data.totalCost
-                })),
-                { persistent: true }
-            );
+            RabbitMQ.publish('booking.confirmed', {
+                bookingId: data.bookingId,
+                userId:    data.userId,
+                email:     data.email,
+                flightId:  bookingDetails.flightId,
+                totalCost: data.totalCost
+            });
+            Logger.info('Published booking.confirmed', { bookingId: data.bookingId });
         } catch (publishError) {
-            console.error('Failed to publish booking.confirmed event:', publishError.message);
+            Logger.error('Failed to publish booking.confirmed event', { bookingId: data.bookingId, err: publishError });
         }
 
     } catch (error) {
@@ -230,19 +236,15 @@ async function cancelBooking(bookingId){
         // Flight Service subscriber increments totalSeats back asynchronously.
         // Wrapped in try-catch: a failed publish does not affect the cancellation.
         try {
-            const channel = RabbitMQ.getChannel();
-            channel.sendToQueue(
-                'seat.restoration',
-                Buffer.from(JSON.stringify({
-                    bookingId: bookingId,
-                    flightId:  bookingDetails.flightId,
-                    seats:     bookingDetails.noOfSeats,
-                    seatClass: bookingDetails.seatClass   // route restoration to correct cabin class
-                })),
-                { persistent: true }
-            );
+            RabbitMQ.publish('seat.restoration', {
+                bookingId: bookingId,
+                flightId:  bookingDetails.flightId,
+                seats:     bookingDetails.noOfSeats,
+                seatClass: bookingDetails.seatClass   // route restoration to correct cabin class
+            });
+            Logger.info('Published seat.restoration', { bookingId, flightId: bookingDetails.flightId });
         } catch (publishError) {
-            console.error('Failed to publish seat.restoration event:', publishError.message);
+            Logger.error('Failed to publish seat.restoration event', { bookingId, err: publishError });
         }
 
     } catch (error) {
@@ -278,24 +280,19 @@ async function cancelOldBookings(){
         // Step 3: publish one seat.restoration event per cancelled booking
         // Flight Service subscribes and restores seats asynchronously
         // If Flight Service is down, events wait durably in the queue until it recovers
-        const channel = RabbitMQ.getChannel();
         expiredBookings.forEach(booking => {
-            channel.sendToQueue(
-                'seat.restoration',
-                Buffer.from(JSON.stringify({
-                    bookingId: booking.id,
-                    flightId:  booking.flightId,
-                    seats:     booking.noOfSeats,
-                    seatClass: booking.seatClass   // route restoration to correct cabin class
-                })),
-                { persistent: true } // message survives RabbitMQ restart
-            );
+            RabbitMQ.publish('seat.restoration', {
+                bookingId: booking.id,
+                flightId:  booking.flightId,
+                seats:     booking.noOfSeats,
+                seatClass: booking.seatClass   // route restoration to correct cabin class
+            });
         });
 
-        console.log(`Cancelled ${ids.length} expired bookings, published ${ids.length} seat restoration events`);
+        Logger.info('Cancelled expired bookings', { count: ids.length, bookingIds: ids });
         return response;
     } catch (error) {
-        console.error('cancelOldBookings cron error:', error.message);
+        Logger.error('cancelOldBookings cron error', { err: error });
     }
 }
 

@@ -1,6 +1,6 @@
 const { Resend } = require('resend');
-const { getChannel } = require('../config/rabbitmq-config');
-const { ServerConfig } = require('../config');
+const { ServerConfig, RabbitMQ, Logger } = require('../config');
+const { REQUEST_ID_HEADER, resolveRequestId, runWithRequestId } = require('../utils/request-context');
 
 const resend = new Resend(ServerConfig.RESEND_API_KEY);
 
@@ -21,64 +21,79 @@ const resend = new Resend(ServerConfig.RESEND_API_KEY);
  * doesn't cause unbounded memory growth from queued messages.
  */
 async function subscribeBookingConfirmed() {
-    const channel = getChannel();
+    // registerConsumer re-runs this after every RabbitMQ reconnect
+    await RabbitMQ.registerConsumer(async (channel) => {
+        // Process one message at a time
+        await channel.prefetch(1);
 
-    // Process one message at a time
-    channel.prefetch(1);
+        await channel.consume('booking.confirmed', (msg) => {
+            if (!msg) return;
+            return handleBookingConfirmed(channel, msg);
+        });
 
-    channel.consume('booking.confirmed', async (msg) => {
-        if (!msg) return;
-
-        let payload;
-        try {
-            payload = JSON.parse(msg.content.toString());
-        } catch (err) {
-            console.error('Failed to parse booking.confirmed message:', err.message);
-            channel.nack(msg, false, false);
-            return;
-        }
-
-        const { bookingId, userId, email, flightId, totalCost } = payload;
-
-        if (!email) {
-            console.error(`booking.confirmed for booking ${bookingId} has no email — discarding`);
-            channel.nack(msg, false, false);
-            return;
-        }
-
-        try {
-            // Send confirmation email via Resend
-            const result = await resend.emails.send({
-                from: ServerConfig.FROM_EMAIL,
-                to: email,
-                subject: 'Your booking is confirmed!',
-                html: `
-                    <h2>Booking Confirmed</h2>
-                    <p>Hi, your flight booking has been confirmed.</p>
-                    <ul>
-                        <li><strong>Booking ID:</strong> ${bookingId}</li>
-                        <li><strong>Flight ID:</strong> ${flightId}</li>
-                        <li><strong>Amount Paid:</strong> ₹${totalCost}</li>
-                    </ul>
-                    <p>Have a great flight!</p>
-                `,
-            });
-
-            if (result?.error) {
-                throw new Error(result.error.message || 'Unknown Resend error');
-            }
-
-            console.log(`Confirmation email sent to ${email} for booking ${bookingId}`);
-            channel.ack(msg);
-        } catch (err) {
-            // nack without requeue — avoid infinite loops on persistent failures
-            // (e.g. Resend API down, invalid email). The message is discarded.
-            console.error(`Failed to send confirmation for booking ${bookingId}:`, err.message);
-            channel.nack(msg, false, false);
-        }
+        Logger.info('Subscribed to booking.confirmed queue');
     });
-
-    console.log('Subscribed to booking.confirmed queue');
 }
 
-module.exports = { subscribeBookingConfirmed };
+/*
+ * handleBookingConfirmed
+ *
+ * Processes one message. Runs inside the request ID carried in the message headers,
+ * so these logs share an ID with the payment request that published the event.
+ */
+function handleBookingConfirmed(channel, msg) {
+    const requestId = resolveRequestId(msg.properties.headers?.[REQUEST_ID_HEADER]);
+    return runWithRequestId(requestId, () => processBookingConfirmed(channel, msg));
+}
+
+async function processBookingConfirmed(channel, msg) {
+    let payload;
+    try {
+        payload = JSON.parse(msg.content.toString());
+    } catch (err) {
+        Logger.error('Failed to parse booking.confirmed message, discarding', { err });
+        channel.nack(msg, false, false);
+        return;
+    }
+
+    const { bookingId, email, flightId, totalCost } = payload;
+
+    if (!email) {
+        Logger.error('booking.confirmed has no email, discarding', { bookingId });
+        channel.nack(msg, false, false);
+        return;
+    }
+
+    try {
+        // Send confirmation email via Resend
+        const result = await resend.emails.send({
+            from: ServerConfig.FROM_EMAIL,
+            to: email,
+            subject: 'Your booking is confirmed!',
+            html: `
+                <h2>Booking Confirmed</h2>
+                <p>Hi, your flight booking has been confirmed.</p>
+                <ul>
+                    <li><strong>Booking ID:</strong> ${bookingId}</li>
+                    <li><strong>Flight ID:</strong> ${flightId}</li>
+                    <li><strong>Amount Paid:</strong> ₹${totalCost}</li>
+                </ul>
+                <p>Have a great flight!</p>
+            `,
+        });
+
+        if (result?.error) {
+            throw new Error(result.error.message || 'Unknown Resend error');
+        }
+
+        Logger.info('Confirmation email sent', { bookingId });
+        channel.ack(msg);
+    } catch (err) {
+        // nack without requeue — avoid infinite loops on persistent failures
+        // (e.g. Resend API down, invalid email). The message is discarded.
+        Logger.error('Failed to send confirmation email, discarding message', { bookingId, err });
+        channel.nack(msg, false, false);
+    }
+}
+
+module.exports = { subscribeBookingConfirmed, handleBookingConfirmed };

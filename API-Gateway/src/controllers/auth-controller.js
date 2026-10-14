@@ -4,6 +4,7 @@ const { StatusCodes } = require('http-status-codes');
 const { User } = require('../models');
 const redis = require('../config/redis-config');
 const { JWT_SECRET, JWT_EXPIRY, SALT_ROUNDS } = require('../config/server-config');
+const logger = require('../config/logger-config');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
@@ -31,7 +32,7 @@ async function register(req, res) {
         if (err.name === 'SequelizeUniqueConstraintError') {
             return res.status(StatusCodes.CONFLICT).json({ message: 'An account with this email already exists' });
         }
-        console.error(err.message);
+        logger.error('Registration failed', { err });
         return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({ message: 'Registration failed. Please try again.' });
     }
 }
@@ -61,7 +62,7 @@ async function login(req, res) {
         const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
         return res.status(StatusCodes.OK).json({ token, userId: user.id });
     } catch (err) {
-        console.error(err.message);
+        logger.error('Login failed', { err });
         return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({ message: 'Sign in failed. Please try again.' });
     }
 }
@@ -78,7 +79,7 @@ async function logout(req, res) {
         }
         return res.status(StatusCodes.OK).json({ message: 'Logged out successfully' });
     } catch (err) {
-        console.error(err.message);
+        logger.error('Logout failed', { err });
         return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({ message: 'Logout failed. Please try again.' });
     }
 }
